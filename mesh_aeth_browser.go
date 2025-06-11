@@ -14,9 +14,16 @@ import (
 	"math/rand"
 	"sync"
 	"time"
+	"net"
+	"net/http"
+	"strings"
+	"bytes"
+	"encoding/base64"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
+	"github.com/google/uuid"
+	"github.com/skip2/go-qrcode"
 )
 
 const (
@@ -34,6 +41,10 @@ var (
 	peers    []string
 	dnsPaths = make(map[string][]string)
 	mutex    sync.Mutex
+
+	// Referral UUIDs
+	generatedReferralUUIDs = make(map[string]bool)
+	referralMutex          = &sync.Mutex{}
 
 	// City grid and player navigation
 	grid             [GRID_HEIGHT][GRID_WIDTH]Cell
@@ -134,6 +145,11 @@ func (g *Game) Update() error {
 	if ebiten.IsKeyPressed(ebiten.KeyEnter) {
 		fmt.Printf("[Navigate] Player at (%d,%d)\n", playerX, playerY)
 	}
+
+	// Trigger referral link generation info
+	if ebiten.IsKeyPressed(ebiten.KeyG) {
+		fmt.Println("[Game] To generate a referral link and QR code, open your web browser to: http://localhost:8080/generate-referral")
+	}
 	return nil
 }
 
@@ -171,7 +187,14 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	sx := (float64(playerX-playerY) * TILE_WIDTH / 2) + SCREEN_WIDTH/2
 	sy := (float64(playerX+playerY) * TILE_HEIGHT / 2) + 50 - TILE_HEIGHT
 	ebitenutil.DebugPrintAt(screen, "@", int(sx+TILE_WIDTH/4), int(sy))
-	// Instructions	ebitenutil.DebugPrintAt(screen, "Arrows to move, Enter to mesh (Path to center in green)", 10, SCREEN_HEIGHT-20)
+
+	// Instructions
+	ebitenutil.DebugPrintAt(screen, "Arrows to move, Enter to mesh (Path to center in green)", 10, SCREEN_HEIGHT-70)
+
+	// Network Status Display
+	ebitenutil.DebugPrintAt(screen, fmt.Sprintf("UDP Server: Running on port %s", UDP_PORT), 10, SCREEN_HEIGHT-55)
+	ebitenutil.DebugPrintAt(screen, "AI Web Server: Running on port 8080", 10, SCREEN_HEIGHT-45) // Assuming port 8080 as per startAIWebServer
+	ebitenutil.DebugPrintAt(screen, "NAT Maintenance: Active", 10, SCREEN_HEIGHT-35)
 }
 
 func (g *Game) Layout(w, h int) (int, int) {
@@ -224,9 +247,164 @@ func findPath(sx, sy, tx, ty int) [][2]int {
 
 // Remaining mesh and AETH code unchanged
 func initAIDiscoveryNodes() { /* ... */ }
-func startUDPServer()         { /* ... */ }
-func maintainNatPaths()       { /* ... */ }
-func startAIWebServer()      { /* ... */ }
-func processAETHMessage(peer, msg string) { /* ... */ }
+
+func startUDPServer() {
+	addr, err := net.ResolveUDPAddr("udp", ":"+UDP_PORT)
+	if err != nil {
+		fmt.Println("Error resolving UDP address:", err)
+		return
+	}
+
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		fmt.Println("Error listening on UDP port:", err)
+		return
+	}
+	defer conn.Close()
+
+	fmt.Printf("UDP server listening on port %s\n", UDP_PORT)
+
+	buffer := make([]byte, 1024) // Buffer to store incoming messages
+
+	for {
+		n, remoteAddr, err := conn.ReadFromUDP(buffer)
+		if err != nil {
+			fmt.Println("Error reading from UDP:", err)
+			continue // Continue listening despite error
+		}
+
+		message := string(buffer[:n])
+		fmt.Printf("Received message from %s: %s\n", remoteAddr.String(), message)
+
+		processAETHMessage(remoteAddr.String(), message)
+	}
+}
+
+func maintainNatPaths() {
+	for {
+		fmt.Println("[NAT] Attempting to maintain NAT paths...")
+
+		// TODO: Implement STUN client logic to discover public IP and port
+		// TODO: Implement UPnP logic to attempt port forwarding
+		// TODO: Manage and refresh mappings
+		// For now, we just simulate the work with a sleep.
+
+		time.Sleep(5 * time.Minute)
+	}
+}
+
+func startAIWebServer() {
+	// Handler for /status
+	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "AI Web Server is running")
+	})
+
+	// Handler for /generate-referral
+	http.HandleFunc("/generate-referral", func(w http.ResponseWriter, r *http.Request) {
+		newUUID := uuid.New().String()
+
+		referralMutex.Lock()
+		generatedReferralUUIDs[newUUID] = true
+		referralMutex.Unlock()
+
+		// Assuming server runs on localhost:8080 for referral links
+		// This port is hardcoded in ListenAndServe call below as well.
+		serverPort := "8080"
+		referralLink := fmt.Sprintf("http://localhost:%s/r/%s", serverPort, newUUID)
+
+		// Generate QR Code
+		var png []byte
+		png, err := qrcode.Encode(referralLink, qrcode.Medium, 256) // Medium ECC, 256x256 pixels
+		if err != nil {
+			http.Error(w, "Failed to generate QR code", http.StatusInternalServerError)
+			fmt.Printf("[AI Web Server] Error generating QR code: %v\n", err)
+			return
+		}
+		qrCodeBase64 := base64.StdEncoding.EncodeToString(png)
+		qrCodeDataURI := "data:image/png;base64," + qrCodeBase64
+
+		// Serve HTML Page
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		htmlContent := fmt.Sprintf(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Your AETH Referral Link</title>
+</head>
+<body>
+    <h1>Share your AETH Referral Link!</h1>
+    <p>Your unique referral link is: <a href="%s">%s</a></p>
+    <p>Scan the QR code:</p>
+    <img src="%s" alt="Referral QR Code">
+</body>
+</html>
+`, referralLink, referralLink, qrCodeDataURI)
+		fmt.Fprint(w, htmlContent)
+		fmt.Printf("[AI Web Server] Generated referral link: %s\n", referralLink)
+	})
+
+	// Handler for /r/:uuid (referral page)
+	http.HandleFunc("/r/", func(w http.ResponseWriter, r *http.Request) {
+		extractedUUID := strings.TrimPrefix(r.URL.Path, "/r/")
+		if extractedUUID == "" || strings.Contains(extractedUUID, "/") {
+			http.NotFound(w, r)
+			fmt.Printf("[AI Web Server] Attempted access to invalid referral path: %s\n", r.URL.Path)
+			return
+		}
+
+		referralMutex.Lock()
+		isValid := generatedReferralUUIDs[extractedUUID]
+		referralMutex.Unlock()
+
+		if isValid {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			htmlContent := `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AETH Mesh Browser Referral</title>
+</head>
+<body>
+    <h1>Welcome! You've been referred to AETH Mesh Browser!</h1>
+    <p><a href="#" onclick="alert('Download would start here!'); return false;">Download Game</a></p>
+    <!-- TODO: Log this referral access for AETH rewards system -->
+</body>
+</html>
+`
+			fmt.Fprint(w, htmlContent)
+			fmt.Printf("[AI Web Server] Served referral page for UUID: %s\n", extractedUUID)
+		} else {
+			http.NotFound(w, r)
+			fmt.Printf("[AI Web Server] Invalid or unknown referral UUID attempted: %s\n", extractedUUID)
+		}
+	})
+
+	port := ":8080"
+	fmt.Printf("[AI Web Server] Starting on port %s...\n", port)
+	err := http.ListenAndServe(port, nil)
+	if err != nil {
+		fmt.Printf("[AI Web Server] Error starting server: %s\n", err)
+	}
+}
+
+func processAETHMessage(peer string, msg string) {
+	fmt.Printf("[AETH] Received message from %s: %s\n", peer, msg)
+
+	// TODO: Parse message format (e.g., JSON, custom binary)
+	// TODO: Implement switch statement or other logic to handle different AETH message types
+	// switch message.Type {
+	// case "PEER_DISCOVERY":
+	//     // handle peer discovery
+	// case "DATA_CHUNK":
+	//     // handle data chunk
+	// default:
+	//     fmt.Println("Unknown AETH message type")
+	// }
+}
+
 func contains(slice []string, s string) bool  { return false }
 func max(a, b int) int                         { return 0 }
