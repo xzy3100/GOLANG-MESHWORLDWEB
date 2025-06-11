@@ -19,6 +19,9 @@ import (
 	"strings"
 	"bytes"
 	"encoding/base64"
+	"io"
+	"errors"
+	// "io/ioutil" // Pre Go 1.16, using io.ReadAll instead
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
@@ -302,47 +305,166 @@ func startAIWebServer() {
 	// Handler for /generate-referral
 	http.HandleFunc("/generate-referral", func(w http.ResponseWriter, r *http.Request) {
 		newUUID := uuid.New().String()
-
 		referralMutex.Lock()
 		generatedReferralUUIDs[newUUID] = true
 		referralMutex.Unlock()
 
-		// Assuming server runs on localhost:8080 for referral links
-		// This port is hardcoded in ListenAndServe call below as well.
-		serverPort := "8080"
-		referralLink := fmt.Sprintf("http://localhost:%s/r/%s", serverPort, newUUID)
+		serverPort := "8080" // Assuming server runs on this port
 
-		// Generate QR Code
-		var png []byte
-		png, err := qrcode.Encode(referralLink, qrcode.Medium, 256) // Medium ECC, 256x256 pixels
-		if err != nil {
-			http.Error(w, "Failed to generate QR code", http.StatusInternalServerError)
-			fmt.Printf("[AI Web Server] Error generating QR code: %v\n", err)
-			return
+		localIP, localErr := getLocalIP()
+		publicIP, publicErr := getPublicIP()
+
+		var localReferralSection, publicReferralSection string
+
+		// Local IP Section
+		if localErr == nil {
+			localReferralLink := fmt.Sprintf("http://%s:%s/r/%s", localIP, serverPort, newUUID)
+			var pngLocal []byte
+			pngLocal, errLocalQR := qrcode.Encode(localReferralLink, qrcode.Medium, 256)
+			if errLocalQR == nil {
+				localQRCodeDataURI := "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngLocal)
+				localReferralSection = fmt.Sprintf(`
+                <div class="ip-section">
+                    <h2>Share on your Local Network:</h2>
+                    <p>Link: <a href="%s" target="_blank">%s</a></p>
+                    <img src="%s" alt="Local Network Referral QR Code">
+                </div>`, localReferralLink, localReferralLink, localQRCodeDataURI)
+			} else {
+				localReferralSection = fmt.Sprintf(`
+                <div class="ip-section">
+                    <h2>Share on your Local Network:</h2>
+                    <p>Referral Link (for %s): Available at <a href="%s" target="_blank">%s</a></p>
+                    <p class="error-text">QR Code generation failed: %s</p>
+                </div>`, localIP, localReferralLink, localReferralLink, errLocalQR.Error())
+			}
+		} else {
+			localReferralSection = fmt.Sprintf(`
+            <div class="ip-section">
+                <h2>Share on your Local Network:</h2>
+                <p class="error-text">Local Network IP: Not available or error: %s</p>
+            </div>`, localErr.Error())
 		}
-		qrCodeBase64 := base64.StdEncoding.EncodeToString(png)
-		qrCodeDataURI := "data:image/png;base64," + qrCodeBase64
+		localReferralSection += `<hr class="section-divider">`
+
+
+		// Public IP Section
+		if publicErr == nil {
+			publicReferralLink := fmt.Sprintf("http://%s:%s/r/%s", publicIP, serverPort, newUUID)
+			var pngPublic []byte
+			pngPublic, errPublicQR := qrcode.Encode(publicReferralLink, qrcode.Medium, 256)
+			if errPublicQR == nil {
+				publicQRCodeDataURI := "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngPublic)
+				publicReferralSection = fmt.Sprintf(`
+                <div class="ip-section">
+                    <h2>Share over the Internet (Advanced):</h2>
+                    <p class="warning-text">WARNING: This link will only work for others if you have configured PORT FORWARDING on your router for port %s to this computer (Local IP: %s). Otherwise, it will not be reachable from the internet.</p>
+                    <p>Link: <a href="%s" target="_blank">%s</a></p>
+                    <img src="%s" alt="Public Internet Referral QR Code">
+                </div>`, serverPort, localIP, publicReferralLink, publicReferralLink, publicQRCodeDataURI)
+			} else {
+				publicReferralSection = fmt.Sprintf(`
+                <div class="ip-section">
+                    <h2>Share over the Internet (Advanced):</h2>
+                    <p class="warning-text">WARNING: This link will only work for others if you have configured PORT FORWARDING on your router for port %s to this computer (Local IP: %s). Otherwise, it will not be reachable from the internet.</p>
+                    <p>Referral Link (for %s): Available at <a href="%s" target="_blank">%s</a></p>
+                    <p class="error-text">QR Code generation failed: %s</p>
+                </div>`, serverPort, localIP, publicIP, publicReferralLink, publicReferralLink, errPublicQR.Error())
+			}
+		} else {
+			publicReferralSection = fmt.Sprintf(`
+            <div class="ip-section">
+                <h2>Share over the Internet (Advanced):</h2>
+                <p class="error-text">Public IP: Not available or error: %s</p>
+            </div>`, publicErr.Error())
+		}
 
 		// Serve HTML Page
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		htmlContent := fmt.Sprintf(`
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
+    <title>Your AETH Referral Links</title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Your AETH Referral Link</title>
+    <style type="text/css">
+        body {
+            margin: 0; padding: 0; background-color: #0a0514;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: #e0e0e0; text-align: center;
+        }
+        .content-wrapper {
+            background: linear-gradient(135deg, rgba(22,0,60,0.85) 0%, rgba(50,0,100,0.85) 25%, rgba(0,100,120,0.85) 75%, rgba(0,20,80,0.85) 100%),
+                        url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><defs><filter id="noise"><feTurbulence type="fractalNoise" baseFrequency="0.65" numOctaves="3" stitchTiles="stitch"/></filter></defs><rect width="100%" height="100%" filter="url(%23noise)" opacity="0.05"/></svg>');
+            background-blend-mode: screen;
+            padding: 20px; border-radius: 15px;
+            box-shadow: 0 0 25px rgba(0, 150, 255, 0.5), 0 0 10px rgba(255,255,255,0.2) inset;
+            width: 90%; max-width: 800px; margin: 30px auto;
+            text-align: left; border: 1px solid rgba(120, 120, 255, 0.3);
+            animation: holographicShimmer 10s infinite linear; position: relative;
+        }
+        @keyframes holographicShimmer {
+            0%% { background-position: 0%% 0%%; } 50%% { background-position: 100%% 100%%; } 100%% { background-position: 0%% 0%%; }
+        }
+        h1 { /* Overall page title */
+            color: #f0f0ff;
+            text-shadow: 0 0 5px #c0c0ff, 0 0 10px #c0c0ff, 0 0 15px #8080ff, 0 0 20px #8080ff, 1px 1px 1px #ff00ff, -1px -1px 1px #00ffff;
+            animation: textGlitch 0.15s infinite alternate;
+            margin-bottom: 30px; text-align: center;
+        }
+        .ip-section { padding: 15px; margin-bottom: 15px; }
+        .ip-section h2 { /* Section titles */
+             color: #d0d0ff; margin-top: 10px; margin-bottom: 15px;
+             border-bottom: 1px solid rgba(120, 120, 255, 0.3);
+             padding-bottom: 10px; text-align: center;
+        }
+        @keyframes textGlitch {
+            0%% { text-shadow: 0 0 5px #c0c0ff, 0 0 10px #c0c0ff, 0 0 15px #8080ff, 0 0 20px #8080ff, 2px 1px 1px #ff00ff, -1px -2px 1px #00ffff; }
+            100%% { text-shadow: 0 0 5px #c0c0ff, 0 0 10px #c0c0ff, 0 0 15px #8080ff, 0 0 20px #8080ff, -2px -1px 1px #ff00ff, 1px 2px 1px #00ffff; }
+        }
+        p { color: #c0c0e0; margin-bottom: 12px; line-height: 1.6; }
+        .ip-section p { text-align: center; } /* Center text within sections by default */
+        .ip-section p a { word-break: break-all; } /* Break long links */
+        .ip-section img { display: block; margin: 15px auto; }
+        a { color: #80ffff; text-decoration: none; font-weight: bold; }
+        a:hover { text-decoration: underline; color: #ffffff; }
+        img {
+            border: 2px solid #8080ff;
+            box-shadow: 0 0 15px #a0a0ff, 0 0 25px #8080ff, 0 0 5px rgba(255,255,255,0.5) inset;
+            margin-top: 10px; border-radius: 10px;
+            max-width: 256px; height: auto;
+            background-color: rgba(255,255,255,0.05);
+        }
+        .warning-text {
+            color: orange !important; font-weight: bold;
+            background-color: rgba(255, 165, 0, 0.15); /* Darker background for warning */
+            padding: 12px; border-radius: 8px;
+            border: 1px solid orange; margin-bottom:15px;
+            text-align: left; /* Align warning text left for readability */
+        }
+        .error-text {
+            color: #ff8080 !important; /* Reddish for errors */
+            font-weight: bold;
+            background-color: rgba(255,0,0,0.1); padding:10px; border-radius:5px;
+        }
+        .section-divider {
+            border: 0; height: 1px;
+            background-image: linear-gradient(to right, rgba(120, 120, 255, 0.1), rgba(120, 120, 255, 0.5), rgba(120, 120, 255, 0.1));
+            margin: 25px 0;
+        }
+    </style>
 </head>
 <body>
-    <h1>Share your AETH Referral Link!</h1>
-    <p>Your unique referral link is: <a href="%s">%s</a></p>
-    <p>Scan the QR code:</p>
-    <img src="%s" alt="Referral QR Code">
+    <div class="content-wrapper">
+        <h1>Your AETH Referral Links</h1>
+        %s <!-- Local IP Section -->
+        %s <!-- Public IP Section -->
+    </div>
 </body>
 </html>
-`, referralLink, referralLink, qrCodeDataURI)
+`, localReferralSection, publicReferralSection)
 		fmt.Fprint(w, htmlContent)
-		fmt.Printf("[AI Web Server] Generated referral link: %s\n", referralLink)
+		fmt.Printf("[AI Web Server] Generated referral links page for UUID: %s (Local IP: %s, Public IP attempted: %s)\n", newUUID, localIP, publicIP) // Adjusted log
 	})
 
 	// Handler for /r/:uuid (referral page)
@@ -362,16 +484,87 @@ func startAIWebServer() {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			htmlContent := `
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
+    <title>AETH Mesh Browser Referral</title>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AETH Mesh Browser Referral</title>
+    <style type="text/css">
+        /* CSS for referral landing page */
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #0a0514; /* Dark violet/blue */
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: #e0e0e0; /* Light text for dark background */
+            text-align: center;
+        }
+        .content-wrapper {
+            background: linear-gradient(135deg, rgba(0,60,80,0.85) 0%, rgba(0,100,120,0.85) 25%, rgba(22,0,60,0.85) 75%, rgba(50,0,100,0.85) 100%),
+                        url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><defs><filter id="noise"><feTurbulence type="fractalNoise" baseFrequency="0.7" numOctaves="2" stitchTiles="stitch"/></filter></defs><rect width="100%" height="100%" filter="url(%23noise)" opacity="0.07"/></svg>');
+            background-blend-mode: screen;
+            padding: 40px;
+            border-radius: 15px;
+            box-shadow: 0 0 30px rgba(0, 200, 255, 0.6), 0 0 15px rgba(255,255,255,0.25) inset;
+            width: 80%;
+            max-width: 600px;
+            margin: 40px auto;
+            text-align: center;
+            border: 1px solid rgba(0, 200, 255, 0.4);
+            animation: holographicShimmer 12s infinite linear; /* Slightly different timing */
+            position: relative;
+        }
+        @keyframes holographicShimmer {
+            0% { background-position: 0% 0%; }
+            50% { background-position: 100% 100%; }
+            100% { background-position: 0% 0%; }
+        }
+        h1 {
+            color: #f0f0ff;
+            text-shadow:
+                0 0 5px #c0c0ff, 0 0 10px #c0c0ff, 0 0 15px #8080ff, 0 0 20px #8080ff,
+                1px 1px 1px #ff00ff, -1px -1px 1px #00ffff;
+            animation: textGlitch 0.15s infinite alternate;
+            margin-bottom: 25px;
+        }
+        @keyframes textGlitch {
+            0% { text-shadow: 0 0 5px #c0c0ff, 0 0 10px #c0c0ff, 0 0 15px #8080ff, 0 0 20px #8080ff, 1px 2px 1px #ff00ff, -2px -1px 1px #00ffff; }
+            100% { text-shadow: 0 0 5px #c0c0ff, 0 0 10px #c0c0ff, 0 0 15px #8080ff, 0 0 20px #8080ff, -1px -2px 1px #ff00ff, 2px 1px 1px #00ffff; }
+        }
+        p { color: #c0c0e0; margin-top: 20px; line-height: 1.7; }
+        .download-button {
+            background: linear-gradient(45deg, #00c6ff, #0072ff);
+            color: white;
+            padding: 15px 30px; /* Enhanced padding */
+            text-decoration: none;
+            border-radius: 10px; /* More rounded */
+            font-size: 1.3em; /* Larger font */
+            font-weight: bold;
+            display: inline-block;
+            margin-top: 30px;
+            border: 1px solid #0072ff;
+            box-shadow: 0 0 10px #00c6ff, 0 0 20px #0072ff, inset 0 0 8px rgba(255,255,255,0.4);
+            transition: all 0.3s ease;
+            animation: buttonGlow 1.5s infinite alternate;
+        }
+        .download-button:hover {
+            background: linear-gradient(45deg, #0072ff, #0052cc);
+            box-shadow: 0 0 20px #0072ff, 0 0 30px #0052cc, inset 0 0 10px rgba(255,255,255,0.6);
+            transform: translateY(-2px); /* Slight lift on hover */
+        }
+        @keyframes buttonGlow {
+            from { box-shadow: 0 0 10px #00c6ff, 0 0 20px #0072ff, inset 0 0 8px rgba(255,255,255,0.4); }
+            to { box-shadow: 0 0 20px #0072ff, 0 0 30px #0052cc, inset 0 0 10px rgba(255,255,255,0.6); }
+        }
+    </style>
 </head>
 <body>
-    <h1>Welcome! You've been referred to AETH Mesh Browser!</h1>
-    <p><a href="#" onclick="alert('Download would start here!'); return false;">Download Game</a></p>
-    <!-- TODO: Log this referral access for AETH rewards system -->
+    <div class="content-wrapper">
+        <h1>Welcome! You've been referred to AETH Mesh Browser!</h1>
+        <p>Join the AETH community and start exploring the decentralized web.</p>
+        <p><a href="#" class="download-button" onclick="alert('Download would start here!'); return false;">Download Game</a></p>
+        <!-- TODO: Log this referral access for AETH rewards system -->
+    </div>
 </body>
 </html>
 `
@@ -390,6 +583,47 @@ func startAIWebServer() {
 		fmt.Printf("[AI Web Server] Error starting server: %s\n", err)
 	}
 }
+
+// getLocalIP attempts to find a non-loopback local IP address.
+func getLocalIP() (string, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "", err
+	}
+	for _, address := range addrs {
+		// Check the address type and if it is not a loopback
+		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil { // Ensure it's an IPv4 address
+				return ipnet.IP.String(), nil
+			}
+		}
+	}
+	return "", errors.New("cannot find local IP address")
+}
+
+// getPublicIP attempts to discover the public IP address using an external service.
+func getPublicIP() (string, error) {
+	// It's good practice to use a client with a timeout.
+	client := http.Client{
+		Timeout: 5 * time.Second,
+	}
+	resp, err := client.Get("https://api.ipify.org?format=text") // Simple text response
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to get public IP: %s (status code: %d)", resp.Status, resp.StatusCode)
+	}
+
+	ipBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	return string(ipBytes), nil
+}
+
 
 func processAETHMessage(peer string, msg string) {
 	fmt.Printf("[AETH] Received message from %s: %s\n", peer, msg)
